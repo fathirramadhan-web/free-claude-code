@@ -380,15 +380,10 @@ def build_responses_chat_request(
     )
     if request.instructions:
         builder.system_parts.append(request.instructions)
-    original_items = _input_items(adapter.original.input)
-    for index, item in enumerate(_input_items(request.input)):
-        source = original_items[index]
-        builder.add(
-            item,
-            source_type=optional_str(source.get("type"))
-            if isinstance(source, dict)
-            else None,
-        )
+    for item, source_type in zip(
+        _input_items(request.input), adapter.input_source_types, strict=True
+    ):
+        builder.add(item, source_type=source_type)
     system_parts, raw_messages = builder.finish()
     messages = cast(
         list[dict[str, object]],

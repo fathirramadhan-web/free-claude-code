@@ -8,7 +8,7 @@ from typing import cast
 from free_claude_code.core.json_types import JsonObject, JsonValue
 
 from .errors import ResponsesConversionError
-from .tools import optional_str, required_str
+from .tools import is_unfinished_client_call, optional_str, required_str
 
 
 def is_client_search(value: Mapping[str, JsonValue]) -> bool:
@@ -23,12 +23,13 @@ def is_client_search(value: Mapping[str, JsonValue]) -> bool:
 class ClientSearchHistory:
     client_items: frozenset[int]
     output_tools: dict[int, list[JsonObject]]
+    omitted_items: frozenset[int]
 
 
 def resolve_client_search_history(items: JsonValue) -> ClientSearchHistory:
     """Infer omitted execution only from search records with the same call ID."""
     if not isinstance(items, list):
-        return ClientSearchHistory(frozenset(), {})
+        return ClientSearchHistory(frozenset(), {}, frozenset())
     searches = {
         index: item
         for index, item in enumerate(items)
@@ -51,6 +52,8 @@ def resolve_client_search_history(items: JsonValue) -> ClientSearchHistory:
         executions[call_id] = cast(str, execution)
     client_items: set[int] = set()
     outputs: dict[int, list[JsonObject]] = {}
+    omitted: set[int] = set()
+    pending: dict[str, int] = {}
     for index, item in searches.items():
         execution = item.get("execution")
         call_id = item.get("call_id")
@@ -59,10 +62,19 @@ def resolve_client_search_history(items: JsonValue) -> ClientSearchHistory:
         if execution != "client":
             continue
         client_items.add(index)
-        if item.get("type") == "tool_search_output":
+        if item.get("type") == "tool_search_call":
+            if is_unfinished_client_call({**item, "execution": "client"}):
+                omitted.add(index)
+            if isinstance(call_id, str) and call_id:
+                pending[call_id] = index
+        else:
+            if isinstance(call_id, str) and pending.pop(call_id, None) in omitted:
+                omitted.add(index)
             tools = item.get("tools")
-            accepted = item.get("status") in (None, "completed") and isinstance(
-                tools, list
+            accepted = (
+                index not in omitted
+                and item.get("status") in (None, "completed")
+                and isinstance(tools, list)
             )
             outputs[index] = _merge_tool_groups(
                 [
@@ -72,7 +84,7 @@ def resolve_client_search_history(items: JsonValue) -> ClientSearchHistory:
                     [],
                 ]
             )
-    return ClientSearchHistory(frozenset(client_items), outputs)
+    return ClientSearchHistory(frozenset(client_items), outputs, frozenset(omitted))
 
 
 def active_client_tools(

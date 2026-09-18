@@ -28,6 +28,7 @@ from .tools import (
     custom_tool_input_text,
     custom_tool_input_text_from_arguments,
     flatten_responses_tool_name,
+    is_unfinished_client_call,
     optional_str,
     required_str,
 )
@@ -68,7 +69,20 @@ class ResponsesToolAdapter:
         self._search_history = (
             resolve_client_search_history(self.request.input)
             if policy.client_tool_search
-            else ClientSearchHistory(frozenset(), {})
+            else ClientSearchHistory(frozenset(), {}, frozenset())
+        )
+        input_items = (
+            self.request.input
+            if isinstance(self.request.input, list)
+            else []
+            if self.request.input is None
+            else [self.request.input]
+        )
+        # Custom and discovery results need their source kinds after filtering.
+        self.input_source_types = tuple(
+            optional_str(item.get("type")) if isinstance(item, dict) else None
+            for index, item in enumerate(input_items)
+            if index not in self._search_history.omitted_items
         )
         if policy == ResponsesToolPolicy():
             return
@@ -110,6 +124,7 @@ class ResponsesToolAdapter:
             self.request.input = [
                 self._input(item, index)
                 for index, item in enumerate(self.request.input)
+                if index not in self._search_history.omitted_items
             ]
         if (
             policy.custom_tools_as_functions
@@ -452,11 +467,23 @@ class ResponsesToolAdapter:
             }
         if self._is_search(value):
             raw = value.get("arguments")
+            search: JsonObject = {
+                **{
+                    key: child
+                    for key, child in value.items()
+                    if key not in {"name", "namespace", "arguments"}
+                },
+                "type": "tool_search_call",
+                "execution": "client",
+                "arguments": raw,
+            }
+            if is_unfinished_client_call(search):
+                if search.get("status") == "in_progress":
+                    search["arguments"] = {}
+                return search
             try:
                 arguments = (
-                    {}
-                    if value.get("status") == "in_progress"
-                    else json.loads(
+                    json.loads(
                         raw,
                         parse_float=_canonical_number,
                         parse_constant=_reject_json_constant,
@@ -468,22 +495,11 @@ class ResponsesToolAdapter:
                 raise ResponsesConversionError(
                     "Invalid client search arguments."
                 ) from exc
-            if not isinstance(arguments, dict) or (
-                not raw and value.get("status") != "in_progress"
-            ):
+            if not isinstance(arguments, dict):
                 raise ResponsesConversionError(
                     "Client search arguments must be a JSON object."
                 )
-            return {
-                **{
-                    key: child
-                    for key, child in value.items()
-                    if key not in {"name", "namespace", "arguments"}
-                },
-                "type": "tool_search_call",
-                "execution": "client",
-                "arguments": arguments,
-            }
+            return {**search, "arguments": arguments}
         if identity is None:
             return value
         if self._policy.flatten_namespaces:
@@ -658,6 +674,10 @@ class ResponsesToolEventAdapter:
         original_item = data.get("item")
         item = self._tools.restore_item(original_item)
         if isinstance(item, dict):
+            if event_type == "response.output_item.done" and is_unfinished_client_call(
+                item
+            ):
+                return
             data["item"] = item
             if item.get("type") == "function_call" and (
                 self._tools._policy.client_tool_search
